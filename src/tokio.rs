@@ -6,8 +6,9 @@
 //! In theory there could be a similar async-std-based implementation.
 
 use futures::{Sink, Stream};
+use std::net::SocketAddr;
 use std::time::Instant;
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
 use url::Host;
 
@@ -21,9 +22,15 @@ use super::{ConnectionContext, ReceivedMessage, WallTime};
 /// Default initial capacity for the read ring buffer (64 KiB).
 const DEFAULT_READ_CAPACITY: usize = 64 * 1024;
 
+/// A byte stream which can carry an RTSP connection.
+///
+/// Blanket-implemented; this exists only to name the bounds in a trait object.
+pub(crate) trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync + ?Sized> ByteStream for T {}
+
 /// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
 pub(crate) struct Connection {
-    stream: TcpStream,
+    stream: Box<dyn ByteStream>,
     ctx: ConnectionContext,
     parser: crate::rtsp::parse::Parser,
     read_buf: MarkBuf,
@@ -38,24 +45,36 @@ impl Connection {
             Host::Ipv4(h) => TcpStream::connect((h, port)).await,
             Host::Ipv6(h) => TcpStream::connect((h, port)).await,
         }?;
-        Self::from_stream(stream)
+        Self::from_tcp(stream)
     }
 
-    pub(crate) fn from_stream(stream: TcpStream) -> Result<Self, std::io::Error> {
-        let established_wall = WallTime::now();
+    pub(crate) fn from_tcp(stream: TcpStream) -> Result<Self, std::io::Error> {
         let local_addr = stream.local_addr()?;
         let peer_addr = stream.peer_addr()?;
-        Ok(Self {
+        Ok(Self::from_stream(
+            Box::new(stream),
+            Some(local_addr),
+            Some(peer_addr),
+        ))
+    }
+
+    /// Wraps an already-established stream, with whatever addresses the caller knows.
+    pub(crate) fn from_stream(
+        stream: Box<dyn ByteStream>,
+        local_addr: Option<SocketAddr>,
+        peer_addr: Option<SocketAddr>,
+    ) -> Self {
+        Self {
             stream,
             ctx: ConnectionContext {
                 local_addr,
                 peer_addr,
-                established_wall,
+                established_wall: WallTime::now(),
             },
             parser: crate::rtsp::parse::Parser::default(),
             read_buf: MarkBuf::new(DEFAULT_READ_CAPACITY),
             write_buf: Vec::new(),
-        })
+        }
     }
 
     pub(crate) fn ctx(&self) -> &ConnectionContext {
@@ -188,31 +207,13 @@ impl Stream for Connection {
                 }
             }
 
-            // Need more data. Read from the stream into the ring buffer
-            // using vectored I/O to fill both halves of the ring.
-            match this.stream.poll_read_ready(cx) {
-                std::task::Poll::Ready(Ok(())) => {}
-                std::task::Poll::Ready(Err(error)) => {
-                    let pos = this.parser.stream_pos() + this.read_buf.unparsed_len() as u64;
-                    return std::task::Poll::Ready(Some(Err(wrap!(ErrorInt::RtspReadError {
-                        conn_ctx: this.ctx,
-                        msg_ctx: RtspMessageContext {
-                            pos,
-                            received_wall: WallTime::now(),
-                            received: Instant::now(),
-                        },
-                        source: error,
-                    }))));
-                }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            }
+            // Need more data. Read from the stream into the ring buffer's
+            // free space, filling its first half before the second (wrapped)
+            // half on a later iteration.
             let (first, second) = this.read_buf.spare_capacity(4096);
-            let mut bufs = [
-                std::io::IoSliceMut::new(first),
-                std::io::IoSliceMut::new(second),
-            ];
-            match this.stream.try_read_vectored(&mut bufs) {
-                Ok(0) => {
+            let mut buf = ReadBuf::new(if first.is_empty() { second } else { first });
+            match std::pin::Pin::new(&mut *this.stream).poll_read(cx, &mut buf) {
+                std::task::Poll::Ready(Ok(())) if buf.filled().is_empty() => {
                     // EOF. Try decode with eof=true.
                     return match try_decode(&mut this.parser, &mut this.read_buf, true) {
                         Ok(Some(msg)) => std::task::Poll::Ready(Some(Ok(msg))),
@@ -225,15 +226,13 @@ impl Stream for Connection {
                         )))),
                     };
                 }
-                Ok(n) => {
+                std::task::Poll::Ready(Ok(())) => {
+                    let n = buf.filled().len();
                     this.read_buf.advance_end(n);
                     // Loop to try decoding again.
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Spurious readiness; re-register and wait.
-                    continue;
-                }
-                Err(error) => {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(Err(error)) => {
                     let pos = this.parser.stream_pos() + this.read_buf.unparsed_len() as u64;
                     return std::task::Poll::Ready(Some(Err(wrap!(ErrorInt::RtspReadError {
                         conn_ctx: this.ctx,

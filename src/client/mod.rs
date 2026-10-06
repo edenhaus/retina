@@ -6,7 +6,7 @@
 use std::convert::TryFrom;
 use std::io;
 use std::mem::MaybeUninit;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
@@ -1049,6 +1049,52 @@ impl From<KeepaliveMethod> for msg::Method {
 pub struct Playing(());
 impl State for Playing {}
 
+/// A connection to an RTSP server established by the caller, for use with
+/// [`Session::describe_with_stream`].
+///
+/// This lets the caller decide how the connection is made: for example, to
+/// wrap it in TLS for `rtsps` URLs, connect to an address it resolved itself,
+/// apply its own socket options, or tunnel it through a proxy.
+pub struct ConnectionStream {
+    stream: Box<dyn crate::tokio::ByteStream>,
+    local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
+}
+
+impl ConnectionStream {
+    /// Wraps a connected byte stream, such as a `tokio::net::TcpStream` or a
+    /// TLS stream on top of one.
+    pub fn new<S>(stream: S) -> Self
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+    {
+        Self {
+            stream: Box::new(stream),
+            local_addr: None,
+            peer_addr: None,
+        }
+    }
+
+    /// Sets the local address of the underlying connection.
+    ///
+    /// This appears in error messages and is required for
+    /// [`Transport::Udp`], which binds its sockets on this address's IP.
+    pub fn local_addr(mut self, local_addr: SocketAddr) -> Self {
+        self.local_addr = Some(local_addr);
+        self
+    }
+
+    /// Sets the peer (server) address of the underlying connection.
+    ///
+    /// This appears in error messages and is required for
+    /// [`Transport::Udp`], which expects RTP from this address's IP unless
+    /// the server's `SETUP` response specifies a `source`.
+    pub fn peer_addr(mut self, peer_addr: SocketAddr) -> Self {
+        self.peer_addr = Some(peer_addr);
+        self
+    }
+}
+
 /// The raw connection, without tracking session state.
 struct RtspConnection {
     inner: crate::tokio::Connection,
@@ -1160,29 +1206,38 @@ enum SessionFlag {
     /// Set if an `OPTIONS` request has completed and advertised supported for
     /// `GET_PARAMETER`.
     GetParameterSupported = 0x10,
+
+    /// Set if the connection was supplied by the caller, so Retina can't open
+    /// a fresh one to retry `TEARDOWN`.
+    CallerConnection = 0x20,
 }
 
 impl RtspConnection {
     async fn connect(url: &Url) -> Result<Self, Error> {
-        let host =
-            RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
+        let host = RtspConnection::validate_url(url, &["rtsp"])
+            .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
         let port = url.port().unwrap_or(554);
         let inner = crate::tokio::Connection::connect(host, port)
             .await
             .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
-        Ok(Self {
+        Ok(Self::new(inner))
+    }
+
+    fn new(inner: crate::tokio::Connection) -> Self {
+        Self {
             inner,
             channels: ChannelMappings::default(),
             next_cseq: 1,
             seen_unassigned: false,
-        })
+        }
     }
 
-    fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
-        if url.scheme() != "rtsp" {
+    fn validate_url<'a>(url: &'a Url, schemes: &[&str]) -> Result<url::Host<&'a str>, String> {
+        if !schemes.contains(&url.scheme()) {
             return Err(format!(
-                "Bad URL {}; only scheme rtsp supported",
-                url.as_str()
+                "Bad URL {}; only scheme {} supported",
+                url.as_str(),
+                schemes.join(" or "),
             ));
         }
         if url.username() != "" || url.password().is_some() {
@@ -1462,6 +1517,52 @@ impl Session<Described> {
         Self::describe_with_conn(conn, options, url).await
     }
 
+    /// Creates a new session from a `DESCRIBE` request on the given URL, over
+    /// a connection the caller has already established.
+    ///
+    /// This is like [`Session::describe`], except that Retina doesn't connect
+    /// to the URL's host itself. The URL is still used as the `Request-URI`
+    /// and as the base for the streams' control URLs. Its scheme may be
+    /// `rtsp` or `rtsps`; for `rtsps`, the caller is responsible for TLS.
+    ///
+    /// Retina can't reopen a caller-supplied connection, so when the session
+    /// is dropped, it tries `TEARDOWN` only once, on this connection,
+    /// regardless of [`SessionOptions::teardown`] (unless that is
+    /// [`TeardownPolicy::Never`]).
+    ///
+    /// [`Transport::Udp`] requires both of the connection's addresses; see
+    /// [`ConnectionStream::local_addr`] and [`ConnectionStream::peer_addr`].
+    ///
+    /// ```no_run
+    /// # async fn f() -> Result<(), Box<dyn std::error::Error>> {
+    /// use retina::client::{ConnectionStream, Session, SessionOptions};
+    ///
+    /// let url = url::Url::parse("rtsp://camera.example/stream")?;
+    /// let tcp = tokio::net::TcpStream::connect("192.0.2.1:554").await?;
+    /// let stream = ConnectionStream::new(tcp)
+    ///     .local_addr("192.0.2.2:50000".parse()?)
+    ///     .peer_addr("192.0.2.1:554".parse()?);
+    /// let session = Session::describe_with_stream(url, SessionOptions::default(), stream).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn describe_with_stream(
+        url: Url,
+        options: SessionOptions,
+        stream: ConnectionStream,
+    ) -> Result<Self, Error> {
+        RtspConnection::validate_url(&url, &["rtsp", "rtsps"])
+            .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
+        let conn = RtspConnection::new(crate::tokio::Connection::from_stream(
+            stream.stream,
+            stream.local_addr,
+            stream.peer_addr,
+        ));
+        let mut session = Self::describe_with_conn(conn, options, url).await?;
+        *session.0.as_mut().project().flags |= SessionFlag::CallerConnection as u8;
+        Ok(session)
+    }
+
     async fn describe_with_conn(
         mut conn: RtspConnection,
         options: SessionOptions,
@@ -1575,9 +1676,18 @@ impl Session<Described> {
                 None
             }
             Transport::Udp(_) => {
+                let ctx = conn.inner.ctx();
+                let (Some(local_addr), Some(peer_addr)) = (ctx.local_addr, ctx.peer_addr) else {
+                    bail!(ErrorInt::FailedPrecondition(
+                        "UDP transport requires the RTSP connection's local and peer \
+                         addresses; see ConnectionStream::local_addr and peer_addr"
+                            .into()
+                    ));
+                };
+
                 // Bind an ephemeral UDP port on the same local address used to connect
                 // to the RTSP server.
-                let local_ip = conn.inner.ctx().local_addr.ip();
+                let local_ip = local_addr.ip();
                 let pair = crate::tokio::UdpPair::for_ip(local_ip)
                     .map_err(|e| wrap!(ErrorInt::Internal(e.into())))?;
                 headers.insert(
@@ -1593,7 +1703,8 @@ impl Session<Described> {
                 Some((
                     UdpStreamContext {
                         local_ip,
-                        peer_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        // Overridden below by the response's `source`, if any.
+                        peer_ip: peer_addr.ip(),
                         local_rtp_port: pair.rtp_port,
                         peer_rtp_port: 0,
                     },
@@ -1708,10 +1819,7 @@ impl Session<Described> {
                 // recording), the source MAY be specified." Not MUST,
                 // unfortunately. But let's see if we can get away with this
                 // for now.
-                let source = match response.source {
-                    Some(s) => s,
-                    None => conn.inner.ctx().peer_addr.ip(),
-                };
+                let source = response.source.unwrap_or(ctx.peer_ip);
                 let server_port = response.server_port.ok_or_else(|| {
                     wrap!(ErrorInt::RtspResponseError {
                         conn_ctx: *conn_ctx,
@@ -2661,7 +2769,12 @@ impl PinnedDrop for SessionInner {
         let this = self.project();
 
         let has_tcp = (*this.flags & (SessionFlag::TcpStreams as u8)) != 0;
+        let caller_connection = (*this.flags & (SessionFlag::CallerConnection as u8)) != 0;
         let just_try_once = match this.options.teardown {
+            TeardownPolicy::Never => return,
+
+            // Retina can't open a fresh connection to retry.
+            _ if caller_connection => true,
             TeardownPolicy::Auto if has_tcp => {
                 // If the server is known to have the live555 bug, try really hard to send a
                 // TEARDOWN before considering the session cleaned up. Otherwise, try once on
@@ -2675,7 +2788,6 @@ impl PinnedDrop for SessionInner {
                     .unwrap_or(false)
             }
             TeardownPolicy::Auto | TeardownPolicy::Always => false,
-            TeardownPolicy::Never => return,
         };
 
         let session = match this.session.take() {
@@ -3084,15 +3196,9 @@ mod tests {
 
     async fn connect_to_mock() -> (RtspConnection, crate::tokio::Connection) {
         let (client, server) = socketpair().await;
-        let client = crate::tokio::Connection::from_stream(client).unwrap();
-        let server = crate::tokio::Connection::from_stream(server).unwrap();
-        let client = RtspConnection {
-            inner: client,
-            channels: ChannelMappings::default(),
-            next_cseq: 1,
-            seen_unassigned: false,
-        };
-        (client, server)
+        let client = crate::tokio::Connection::from_tcp(client).unwrap();
+        let server = crate::tokio::Connection::from_tcp(server).unwrap();
+        (RtspConnection::new(client), server)
     }
 
     /// Receives a request and sends a response, filling in the matching `CSeq`.
@@ -3234,6 +3340,156 @@ mod tests {
         );
         tokio::time::pause();
         assert_eq!(group.stale_sessions().num_sessions, 0);
+    }
+
+    /// Plays a session over a caller-supplied in-memory stream with an `rtsps`
+    /// URL, then checks the `TEARDOWN` is tried only on that connection.
+    #[tokio::test]
+    async fn describe_with_stream() {
+        init_logging();
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let mut server = crate::tokio::Connection::from_stream(Box::new(server), None, None);
+        let local_addr: SocketAddr = "192.0.2.2:50000".parse().unwrap();
+        let peer_addr: SocketAddr = "192.0.2.1:322".parse().unwrap();
+        let stream = ConnectionStream::new(client)
+            .local_addr(local_addr)
+            .peer_addr(peer_addr);
+        let url = Url::parse("rtsps://camera.invalid/h264Preview_01_main").unwrap();
+        let group = Arc::new(SessionGroup::default());
+
+        // DESCRIBE.
+        let (session, _) = tokio::join!(
+            Session::describe_with_stream(
+                url,
+                SessionOptions::default()
+                    .session_group(group.clone())
+                    .teardown(TeardownPolicy::Always),
+                stream,
+            ),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        let ctx = *session.0.conn.as_ref().unwrap().inner.ctx();
+        assert_eq!(
+            (ctx.local_addr, ctx.peer_addr),
+            (Some(local_addr), Some(peer_addr))
+        );
+        assert!(
+            ctx.to_string()
+                .starts_with("192.0.2.2:50000(me)->192.0.2.1:322@")
+        );
+
+        // SETUP.
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+
+        // PLAY.
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        {
+            let session = session.unwrap();
+            tokio::pin!(session);
+            let pkt = b"\x80\x60\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8hello world";
+            let (item, _) = tokio::join!(
+                session.next(),
+                server.send(OwnedMessage::Data {
+                    channel_id: 0,
+                    body: Bytes::from_static(pkt),
+                }),
+            );
+            match item {
+                Some(Ok(PacketItem::Rtp(p))) => assert_eq!(p.payload(), b"hello world"),
+                o => panic!("unexpected item: {o:#?}"),
+            }
+        };
+
+        // Drop. Even with `TeardownPolicy::Always`, Retina tries `TEARDOWN`
+        // only on the supplied connection, rather than retrying on fresh
+        // connections to `camera.invalid` until the session expires.
+        let stale_sessions = group.stale_sessions();
+        assert_eq!(stale_sessions.num_sessions, 1);
+        let teardown = async {
+            let msg = server.next().await.unwrap().unwrap();
+            assert!(matches!(
+                msg.msg,
+                msg::Message::Request(ref r) if r.method == msg::Method::TEARDOWN
+            ));
+            drop(server); // fail the attempt by closing without a response.
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures::future::join(group.await_stale_sessions(&stale_sessions), teardown),
+        )
+        .await
+        .unwrap();
+        assert_eq!(group.stale_sessions().num_sessions, 0);
+    }
+
+    /// UDP transport is refused when a caller-supplied stream has no addresses.
+    #[tokio::test]
+    async fn describe_with_stream_udp_requires_addrs() {
+        init_logging();
+        let e = Session::describe_with_stream(
+            Url::parse("http://camera.invalid/").unwrap(),
+            SessionOptions::default(),
+            ConnectionStream::new(tokio::io::duplex(1).0),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            e.to_string()
+                .contains("only scheme rtsp or rtsps supported"),
+            "{e}"
+        );
+
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let mut server = crate::tokio::Connection::from_stream(Box::new(server), None, None);
+        let url = Url::parse("rtsp://camera.invalid/h264Preview_01_main").unwrap();
+        let (session, _) = tokio::join!(
+            Session::describe_with_stream(
+                url,
+                SessionOptions::default(),
+                ConnectionStream::new(client)
+            ),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        let ctx = session.0.conn.as_ref().unwrap().inner.ctx();
+        assert!(ctx.to_string().starts_with("?(me)->?@"), "{ctx}");
+        let e = session
+            .setup(
+                0,
+                SetupOptions::default().transport(Transport::Udp(UdpTransportOptions::default())),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("UDP transport requires"),
+            "unexpected error: {e}"
+        );
     }
 
     /// As above, but TEARDOWN fails until session expiration.

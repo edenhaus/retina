@@ -261,8 +261,12 @@ impl From<WallTime> for SystemTime {
 /// This gives enough information to pick out the flow in a packet capture.
 #[derive(Copy, Clone, Debug)]
 pub struct ConnectionContext {
-    local_addr: std::net::SocketAddr,
-    peer_addr: std::net::SocketAddr,
+    /// The local address, if known. Always known for connections Retina
+    /// opened itself; optional for caller-supplied streams.
+    local_addr: Option<std::net::SocketAddr>,
+
+    /// The peer address, if known; see `local_addr`.
+    peer_addr: Option<std::net::SocketAddr>,
     established_wall: WallTime,
 }
 
@@ -271,9 +275,21 @@ impl ConnectionContext {
     pub fn dummy() -> Self {
         let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
         Self {
-            local_addr: addr,
-            peer_addr: addr,
+            local_addr: Some(addr),
+            peer_addr: Some(addr),
             established_wall: WallTime::now(),
+        }
+    }
+}
+
+/// Displays an address which may be unknown as `?`.
+struct MaybeAddr(Option<SocketAddr>);
+
+impl Display for MaybeAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(addr) => Display::fmt(&addr, f),
+            None => f.write_str("?"),
         }
     }
 }
@@ -285,7 +301,9 @@ impl Display for ConnectionContext {
         write!(
             f,
             "{}(me)->{}@{}",
-            self.local_addr, self.peer_addr, self.established_wall,
+            MaybeAddr(self.local_addr),
+            MaybeAddr(self.peer_addr),
+            self.established_wall,
         )
     }
 }
