@@ -267,6 +267,20 @@ pub struct ConnectionContext {
 }
 
 impl ConnectionContext {
+    /// Creates a context for a connection between the given addresses,
+    /// established now.
+    ///
+    /// This is for a [`crate::client::TcpOpener`] to describe the connections
+    /// it opens. For a TLS or proxied connection, use the addresses of the
+    /// underlying socket, which are what identify the flow in a packet capture.
+    pub fn new(local_addr: SocketAddr, peer_addr: SocketAddr) -> Self {
+        Self {
+            local_addr,
+            peer_addr,
+            established_wall: WallTime::now(),
+        }
+    }
+
     #[doc(hidden)]
     pub fn dummy() -> Self {
         let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);

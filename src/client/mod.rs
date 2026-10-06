@@ -14,6 +14,7 @@ use std::time::Instant;
 use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 
 use self::channel_mapping::*;
+pub use self::opener::{TcpConnection, TcpOpener};
 pub use self::timeline::Timeline;
 use crate::inputs::Input;
 use crate::rtsp::msg::{self as msg, OwnedMessage, StatusCode};
@@ -33,6 +34,7 @@ use crate::{
 };
 
 mod channel_mapping;
+mod opener;
 mod parse;
 
 /// Internal API, public for a benchmark only.
@@ -479,6 +481,7 @@ pub struct SessionOptions {
     teardown: TeardownPolicy,
     unassigned_channel_data: UnassignedChannelDataPolicy,
     session_id: SessionIdPolicy,
+    tcp_opener: Option<Arc<dyn TcpOpener>>,
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -659,6 +662,21 @@ impl SessionOptions {
 
     pub fn session_id(mut self, policy: SessionIdPolicy) -> Self {
         self.session_id = policy;
+        self
+    }
+
+    /// Opens the session's RTSP connections with the given [`TcpOpener`]
+    /// rather than Retina's built-in TCP connect.
+    ///
+    /// The opener is used both for the initial connection and for any fresh
+    /// connections to retry `TEARDOWN` after the session is dropped. With an
+    /// opener, URLs may use the `rtsps` scheme as well as `rtsp`; the opener
+    /// is responsible for TLS. Only [`Transport::Tcp`] is supported:
+    /// [`Session::setup`] with [`Transport::Udp`] returns an error.
+    ///
+    /// See [`TcpOpener`] for an example.
+    pub fn tcp_opener(mut self, opener: Arc<dyn TcpOpener>) -> Self {
+        self.tcp_opener = Some(opener);
         self
     }
 }
@@ -1163,13 +1181,19 @@ enum SessionFlag {
 }
 
 impl RtspConnection {
-    async fn connect(url: &Url) -> Result<Self, Error> {
-        let host =
-            RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
-        let port = url.port().unwrap_or(554);
-        let inner = crate::tokio::Connection::connect(host, port)
-            .await
-            .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+    /// Connects for requests to `url`, via `options`' [`TcpOpener`] if any.
+    async fn connect(url: &Url, options: &SessionOptions) -> Result<Self, Error> {
+        let opener = options.tcp_opener.as_deref();
+        let host = RtspConnection::validate_url(url, opener.is_some())
+            .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
+        let inner = match opener {
+            Some(opener) => opener
+                .open(url)
+                .await
+                .map(crate::tokio::Connection::from_custom),
+            None => crate::tokio::Connection::connect(host, url.port().unwrap_or(554)).await,
+        }
+        .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
         Ok(Self {
             inner,
             channels: ChannelMappings::default(),
@@ -1178,12 +1202,26 @@ impl RtspConnection {
         })
     }
 
-    fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
-        if url.scheme() != "rtsp" {
-            return Err(format!(
-                "Bad URL {}; only scheme rtsp supported",
-                url.as_str()
-            ));
+    /// Checks `url` is usable; `custom_opener` allows `rtsps`, as a
+    /// [`TcpOpener`] may speak TLS.
+    fn validate_url(url: &Url, custom_opener: bool) -> Result<url::Host<&str>, String> {
+        match url.scheme() {
+            "rtsp" => {}
+            "rtsps" if custom_opener => {}
+            "rtsps" => {
+                return Err(format!(
+                    "Bad URL {}; only scheme rtsp supported without \
+                     SessionOptions::tcp_opener",
+                    url.as_str()
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "Bad URL {}; only scheme rtsp{} supported",
+                    url.as_str(),
+                    if custom_opener { " or rtsps" } else { "" },
+                ));
+            }
         }
         if url.username() != "" || url.password().is_some() {
             // Url apparently doesn't even have a way to clear the credentials,
@@ -1458,7 +1496,7 @@ impl Session<Described> {
     ///
     /// Expects to be called from a tokio runtime.
     pub async fn describe(url: Url, options: SessionOptions) -> Result<Self, Error> {
-        let conn = RtspConnection::connect(&url).await?;
+        let conn = RtspConnection::connect(&url, &options).await?;
         Self::describe_with_conn(conn, options, url).await
     }
 
@@ -1575,6 +1613,12 @@ impl Session<Described> {
                 None
             }
             Transport::Udp(_) => {
+                if inner.options.tcp_opener.is_some() {
+                    bail!(ErrorInt::FailedPrecondition(
+                        "UDP transport isn't supported with a custom TcpOpener".into()
+                    ));
+                }
+
                 // Bind an ephemeral UDP port on the same local address used to connect
                 // to the RTSP server.
                 let local_ip = conn.inner.ctx().local_addr.ip();
@@ -3100,15 +3144,14 @@ mod tests {
         server: &mut crate::tokio::Connection,
         expected_method: msg::Method,
         (mut response, resp_body): (msg::Response, Bytes),
-    ) {
+    ) -> msg::Request {
         let msg = server.next().await.unwrap().unwrap();
-        let cseq = match msg.msg {
-            msg::Message::Request(ref r) => {
-                assert_eq!(r.method, expected_method);
-                r.headers.get("CSeq").unwrap().to_string()
-            }
+        let req = match msg.msg {
+            msg::Message::Request(r) => r,
             _ => panic!(),
         };
+        assert_eq!(req.method, expected_method);
+        let cseq = req.headers.get("CSeq").unwrap().to_string();
         response.headers.insert(
             msg::HeaderName::CSEQ,
             msg::HeaderValue::try_from(cseq).unwrap(),
@@ -3120,6 +3163,7 @@ mod tests {
             })
             .await
             .unwrap();
+        req
     }
 
     /// Tests the happy path from initialization to teardown (first attempt succeeds).
@@ -3606,6 +3650,405 @@ mod tests {
                 response(include_bytes!("testdata/h264dvr_setup_audio.txt"))
             ),
         );
+    }
+
+    /// A [`TcpConnection`] over an in-memory stream.
+    struct DuplexConn {
+        stream: tokio::io::DuplexStream,
+        ctx: crate::ConnectionContext,
+    }
+
+    impl tokio::io::AsyncRead for DuplexConn {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for DuplexConn {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.stream).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    impl TcpConnection for DuplexConn {
+        fn ctx(&self) -> crate::ConnectionContext {
+            self.ctx
+        }
+    }
+
+    /// Reads from a [`TcpConnection`] fill the read ring buffer correctly as
+    /// its free space wraps around.
+    #[tokio::test]
+    async fn tcp_connection_read_wraps_ring() {
+        use tokio::io::AsyncWriteExt as _;
+        const N: usize = 200;
+        const LEN: usize = 997;
+        let (client, mut server) = tokio::io::duplex(1500);
+        let mut conn = crate::tokio::Connection::from_custom(Box::new(DuplexConn {
+            stream: client,
+            ctx: crate::ConnectionContext::dummy(),
+        }));
+        let initial_capacity = conn.read_buf().capacity();
+        assert!(N * (4 + LEN) > 2 * initial_capacity);
+        tokio::join!(
+            async move {
+                for i in 0..N {
+                    let mut msg = vec![b'$', 0, (LEN >> 8) as u8, LEN as u8];
+                    msg.extend((0..LEN).map(|j| (i + j) as u8));
+                    server.write_all(&msg).await.unwrap();
+                }
+            },
+            async {
+                for i in 0..N {
+                    let msg = conn.next().await.unwrap().unwrap();
+                    let body = conn.body_bytes(msg.body_pos, msg.body_len);
+                    assert_eq!(body.len(), LEN);
+                    assert!(
+                        body.iter().enumerate().all(|(j, &b)| b == (i + j) as u8),
+                        "message {i} corrupt"
+                    );
+                }
+                assert!(conn.next().await.is_none(), "expected EOF");
+            },
+        );
+        assert_eq!(conn.read_buf().capacity(), initial_capacity);
+    }
+
+    /// The local and peer addresses [`TestOpener`] reports.
+    const OPENER_LOCAL_ADDR: &str = "192.0.2.2:50000";
+    const OPENER_PEER_ADDR: &str = "192.0.2.1:322";
+
+    /// A [`TcpOpener`] which hands out queued in-memory connections and
+    /// records the URLs it's asked to open.
+    #[derive(Default)]
+    struct TestOpener {
+        conns: Mutex<std::collections::VecDeque<io::Result<DuplexConn>>>,
+        urls: Mutex<Vec<Url>>,
+    }
+
+    impl TestOpener {
+        /// Queues a connection, returning the server's end of it.
+        fn push_conn(&self) -> crate::tokio::Connection {
+            let (client, server) = tokio::io::duplex(1 << 16);
+            let local_addr = OPENER_LOCAL_ADDR.parse().unwrap();
+            let peer_addr = OPENER_PEER_ADDR.parse().unwrap();
+            self.conns.lock().unwrap().push_back(Ok(DuplexConn {
+                stream: client,
+                ctx: crate::ConnectionContext::new(local_addr, peer_addr),
+            }));
+            crate::tokio::Connection::from_custom(Box::new(DuplexConn {
+                stream: server,
+                ctx: crate::ConnectionContext::new(peer_addr, local_addr),
+            }))
+        }
+
+        fn urls(&self) -> Vec<Url> {
+            self.urls.lock().unwrap().clone()
+        }
+    }
+
+    impl TcpOpener for TestOpener {
+        fn open<'a>(
+            &'a self,
+            url: &'a Url,
+        ) -> futures::future::BoxFuture<'a, io::Result<Box<dyn TcpConnection>>> {
+            self.urls.lock().unwrap().push(url.clone());
+            let conn = self
+                .conns
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(io::Error::other("no more test connections")));
+            Box::pin(async move { conn.map(|c| Box::new(c) as Box<dyn TcpConnection>) })
+        }
+    }
+
+    /// Plays a session over a [`TcpOpener`] connection to an `rtsps` URL.
+    ///
+    /// The URL is sent as given, and the opener's `ConnectionContext` is the
+    /// one reported in errors.
+    #[tokio::test]
+    async fn tcp_opener_rtsps() {
+        init_logging();
+        let opener = Arc::new(TestOpener::default());
+        let mut server = opener.push_conn();
+        let url = Url::parse("rtsps://camera.invalid/h264Preview_01_main").unwrap();
+        let options = SessionOptions::default()
+            .tcp_opener(opener.clone())
+            .teardown(TeardownPolicy::Never)
+            .unassigned_channel_data(UnassignedChannelDataPolicy::Error);
+
+        // DESCRIBE.
+        let (session, describe) = tokio::join!(
+            Session::describe(url.clone(), options),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        assert_eq!(describe.request_uri.as_ref(), Some(&url));
+        assert_eq!(opener.urls(), [url]);
+        let expected_ctx = format!("{OPENER_LOCAL_ADDR}(me)->{OPENER_PEER_ADDR}@");
+        let ctx = session.0.conn.as_ref().unwrap().inner.ctx().to_string();
+        assert!(ctx.starts_with(&expected_ctx), "{ctx}");
+
+        // SETUP.
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+
+        // PLAY.
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let session = session.unwrap();
+        tokio::pin!(session);
+
+        // A packet, then data on an unassigned channel, which is an error.
+        let pkt = b"\x80\x60\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8hello world";
+        for (channel_id, body) in [(0, &pkt[..]), (2, b"unassigned")] {
+            server
+                .send(OwnedMessage::Data {
+                    channel_id,
+                    body: Bytes::copy_from_slice(body),
+                })
+                .await
+                .unwrap();
+        }
+        match session.next().await {
+            Some(Ok(PacketItem::Rtp(p))) => assert_eq!(p.payload(), b"hello world"),
+            o => panic!("unexpected item: {o:#?}"),
+        }
+        match session.next().await {
+            Some(Err(e)) => {
+                assert!(
+                    matches!(*e.0, ErrorInt::RtspUnassignedChannelError { .. }),
+                    "{e}"
+                );
+                assert!(
+                    e.to_string().contains(&format!("conn: {expected_ctx}")),
+                    "{e}"
+                );
+            }
+            o => panic!("unexpected item: {o:#?}"),
+        }
+    }
+
+    /// When `TEARDOWN` fails on the existing connection, Retina retries on a
+    /// fresh one from the [`TcpOpener`].
+    #[tokio::test]
+    async fn tcp_opener_teardown_redial() {
+        init_logging();
+        let opener = Arc::new(TestOpener::default());
+        let mut server = opener.push_conn();
+        let url = Url::parse("rtsps://camera.invalid/h264Preview_01_main").unwrap();
+        let group = Arc::new(SessionGroup::default());
+        let options = SessionOptions::default()
+            .tcp_opener(opener.clone())
+            .session_group(group.clone())
+            .teardown(TeardownPolicy::Always);
+
+        // DESCRIBE.
+        let (session, _) = tokio::join!(
+            Session::describe(url.clone(), options),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+
+        // SETUP and PLAY.
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let session = session.unwrap();
+
+        // Close the server's end, so `TEARDOWN` on the existing connection
+        // fails, then drop the session.
+        drop(server);
+        let mut fresh_server = opener.push_conn();
+        drop(session);
+        let stale_sessions = group.stale_sessions();
+        assert_eq!(stale_sessions.num_sessions, 1);
+
+        let (_, teardown) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures::future::join(
+                group.await_stale_sessions(&stale_sessions),
+                req_response(
+                    &mut fresh_server,
+                    msg::Method::TEARDOWN,
+                    response(include_bytes!("testdata/reolink_teardown.txt")),
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(group.stale_sessions().num_sessions, 0);
+
+        // The fresh connection is for the presentation's base URL, from the
+        // `DESCRIBE` response's `Content-Base`.
+        let base_url = Url::parse("rtsp://192.168.5.206/h264Preview_01_main/").unwrap();
+        assert_eq!(opener.urls(), [url, base_url.clone()]);
+        assert_eq!(teardown.request_uri, Some(base_url));
+    }
+
+    /// A [`TcpOpener`] error is returned as a connect error.
+    #[tokio::test]
+    async fn tcp_opener_error() {
+        init_logging();
+        let opener = Arc::new(TestOpener::default());
+        opener
+            .conns
+            .lock()
+            .unwrap()
+            .push_back(Err(io::Error::other("handshake failed")));
+        let url = Url::parse("rtsps://camera.invalid/").unwrap();
+        let e = Session::describe(url, SessionOptions::default().tcp_opener(opener.clone()))
+            .await
+            .map(drop)
+            .unwrap_err();
+        assert!(matches!(*e.0, ErrorInt::ConnectError(_)), "{e}");
+        assert!(e.to_string().contains("handshake failed"), "{e}");
+        assert_eq!(opener.urls().len(), 1);
+    }
+
+    /// UDP transport is refused with a [`TcpOpener`], without sending `SETUP`.
+    #[tokio::test]
+    async fn tcp_opener_udp_refused() {
+        init_logging();
+        let opener = Arc::new(TestOpener::default());
+        let mut server = opener.push_conn();
+        let url = Url::parse("rtsp://camera.invalid/h264Preview_01_main").unwrap();
+        let (session, _) = tokio::join!(
+            Session::describe(url, SessionOptions::default().tcp_opener(opener)),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        let setup = session.setup(
+            0,
+            SetupOptions::default().transport(Transport::Udp(UdpTransportOptions::default())),
+        );
+        let e = futures::FutureExt::now_or_never(setup)
+            .expect("setup should fail without waiting for the server")
+            .unwrap_err();
+        assert!(matches!(*e.0, ErrorInt::FailedPrecondition(_)), "{e}");
+        assert!(e.to_string().contains("TcpOpener"), "{e}");
+        assert!(
+            futures::FutureExt::now_or_never(server.next()).is_none(),
+            "sent a request"
+        );
+    }
+
+    /// Without a [`TcpOpener`], only `rtsp` URLs are accepted, as before;
+    /// with one, `rtsps` is too, but other schemes and credentials still aren't.
+    #[tokio::test]
+    async fn url_schemes() {
+        init_logging();
+        let describe = |url: &str, opener: bool| {
+            let url = Url::parse(url).unwrap();
+            let mut options = SessionOptions::default();
+            if opener {
+                options = options.tcp_opener(Arc::new(TestOpener::default()));
+            }
+            async move { Session::describe(url, options).await.map(drop).unwrap_err() }
+        };
+        for (url, opener, expected) in [
+            (
+                "rtsps://camera.invalid/",
+                false,
+                "without SessionOptions::tcp_opener",
+            ),
+            (
+                "http://camera.invalid/",
+                false,
+                "only scheme rtsp supported",
+            ),
+            (
+                "http://camera.invalid/",
+                true,
+                "only scheme rtsp or rtsps supported",
+            ),
+            (
+                "rtsps://u:p@camera.invalid/",
+                true,
+                "must not contain credentials",
+            ),
+        ] {
+            let e = describe(url, opener).await;
+            assert!(matches!(*e.0, ErrorInt::InvalidArgument(_)), "{url}: {e}");
+            assert!(e.to_string().contains(expected), "{url}: {e}");
+        }
+
+        // With an opener, an `rtsps` URL gets as far as the opener.
+        let e = describe("rtsps://camera.invalid/", true).await;
+        assert!(matches!(*e.0, ErrorInt::ConnectError(_)), "{e}");
+    }
+
+    #[test]
+    fn session_types_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SessionOptions>();
+        assert_send_sync::<Session<Described>>();
+        assert_send_sync::<Session<Playing>>();
+        assert_send_sync::<Demuxed>();
     }
 
     // See with: cargo test -- --nocapture client::tests::print_sizes
